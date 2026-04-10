@@ -50,8 +50,116 @@ class MujocoEnv(Environment):
             self.visualizer = None
 
         self.last_time = time.time()
+        self.random_heading = cfg_env.random_heading
+
+        self._apply_random_heading()
+
+        # Virtual gantry: spring-damper harness.
+        # Displacement is computed from the ROOT body (pelvis / free joint).
+        # Force is applied at the attachment bodies (shoulders preferred).
+        # A rest length provides slack so the spring only engages on large drops.
+        self._gantry_enabled = False
+        self._gantry_anchor = None  # target position (from root body) [3]
+        self._gantry_stiffness = 2000.0  # N/m
+        self._gantry_damping = 400.0  # Ns/m
+        self._gantry_rest_length = 0.05  # meters of slack before spring engages
+
+        # Root body (pelvis) — used for displacement computation.
+        self._gantry_root_id = mujoco.mj_name2id(  # pyright: ignore[reportAttributeAccessIssue]
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+        )
+
+        # Attachment bodies — where force is applied.
+        _gantry_body_sets = [
+            ["left_shoulder_pitch_link", "right_shoulder_pitch_link"],
+            ["torso_link"],
+            ["pelvis"],
+        ]
+        self._gantry_body_ids = []
+        self._gantry_body_names = []
+        for body_set in _gantry_body_sets:
+            bids = []
+            for name in body_set:
+                bid = mujoco.mj_name2id(  # pyright: ignore[reportAttributeAccessIssue]
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, name
+                )
+                if bid >= 0:
+                    bids.append(bid)
+            if len(bids) == len(body_set):
+                self._gantry_body_ids = bids
+                self._gantry_body_names = body_set
+                break
+        if not self._gantry_body_ids:
+            logger.warning("Virtual gantry: no suitable bodies found, gantry disabled")
 
         self.update()  # get initial state
+
+    def _apply_random_heading(self):
+        """Rotate the root body by a random yaw if random_heading is enabled."""
+        if not self.random_heading:
+            return
+        yaw = np.random.uniform(0, 2 * np.pi)
+        c, s = np.cos(yaw / 2), np.sin(yaw / 2)
+        q = self.data.qpos[3:7].copy()  # MuJoCo [w, x, y, z]
+        # Pre-multiply by yaw rotation q_yaw=[c,0,0,s]: q_new = q_yaw ⊗ q
+        self.data.qpos[3] = c * q[0] - s * q[3]
+        self.data.qpos[4] = c * q[1] - s * q[2]
+        self.data.qpos[5] = c * q[2] + s * q[1]
+        self.data.qpos[6] = c * q[3] + s * q[0]
+
+    def enable_gantry(self):
+        """Attach gantry at the root body's current position."""
+        if not self._gantry_body_ids:
+            logger.warning("No gantry bodies — skipping enable")
+            return
+        # Anchor is the root body (pelvis) position — displacement computed from here.
+        self._gantry_anchor = self.data.xpos[self._gantry_root_id].copy()
+        self._gantry_enabled = True
+        logger.info(
+            f"Virtual gantry enabled: root=pelvis, apply={self._gantry_body_names}, "
+            f"anchor={self._gantry_anchor.round(3).tolist()}, "
+            f"k={self._gantry_stiffness}, c={self._gantry_damping}, "
+            f"rest_len={self._gantry_rest_length}"
+        )
+
+    def disable_gantry(self):
+        """Release all gantry bodies to free dynamics."""
+        self._gantry_enabled = False
+        for bid in self._gantry_body_ids:
+            self.data.xfrc_applied[bid, :] = 0.0
+        logger.info("Virtual gantry disabled")
+
+    def _apply_gantry_force(self):
+        """Compute spring-damper force from ROOT displacement, apply at attachment bodies.
+
+        Like holosoma: displacement and velocity are read from the root body (pelvis).
+        The resulting force is split equally across the attachment bodies (shoulders).
+        A rest length provides slack — the spring only engages beyond that distance.
+        """
+        # Compute displacement from root body to anchor.
+        root_pos = self.data.xpos[self._gantry_root_id]
+        root_vel = self.data.cvel[self._gantry_root_id, 3:]  # linear velocity
+
+        dx = self._gantry_anchor - root_pos
+        distance = np.linalg.norm(dx)
+
+        if distance < 1e-8:
+            force = -self._gantry_damping * root_vel
+        else:
+            direction = dx / distance
+            v_radial = np.dot(root_vel, direction)
+            # Spring only engages beyond rest length (slack).
+            stretch = max(distance - self._gantry_rest_length, 0.0)
+            force = (
+                self._gantry_stiffness * stretch - self._gantry_damping * v_radial
+            ) * direction
+
+        # Split force equally across attachment bodies.
+        n = len(self._gantry_body_ids)
+        per_body_force = force / n
+        for bid in self._gantry_body_ids:
+            self.data.xfrc_applied[bid, :3] = per_body_force
+            self.data.xfrc_applied[bid, 3:] = 0.0
 
     def reborn(self, init_qpos=None):
         if init_qpos is not None:
@@ -60,6 +168,7 @@ class MujocoEnv(Environment):
             self.data.ctrl[:] = 0.0
         else:
             mujoco.mj_resetDataKeyframe(self.model, self.data, 0)  # pyright: ignore[reportAttributeAccessIssue]
+            self._apply_random_heading()
         mujoco.mj_forward(self.model, self.data)  # pyright: ignore[reportAttributeAccessIssue]
 
     def reset(self):
@@ -134,6 +243,9 @@ class MujocoEnv(Environment):
             torque = np.clip(torque, -self.torque_limits, self.torque_limits)
 
             self.data.ctrl = torque
+
+            if self._gantry_enabled:
+                self._apply_gantry_force()
 
             mujoco.mj_step(self.model, self.data)  # pyright: ignore[reportAttributeAccessIssue]
             self.update(simple=True)

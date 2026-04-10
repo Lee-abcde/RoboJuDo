@@ -85,8 +85,8 @@ class RlPipeline(Pipeline):
         self.freq = self.cfg.policy.freq
         self.dt = 1.0 / self.freq
 
-        self.self_check()
         self.reset()
+        self.self_check()
 
     def self_check(self):
         self.env.self_check()
@@ -102,6 +102,20 @@ class RlPipeline(Pipeline):
         self.policy.reset()
         self.ctrl_manager.reset()
 
+        # Blend-out state: transitions policy → init pose (frame 0) at end of motion.
+        self._blend_out_active = False
+        self._blend_out_step = 0
+        self._blend_out_duration = int(5.0 * self.freq)  # 5 seconds
+        self._init_dof_pos = np.asarray(self.policy.get_init_dof_pos(), dtype=np.float32)
+        self._pending_blend_in = False
+        self._blend_in_completed = False
+        self._user_fade_out = False  # True when fade-out was user-triggered (not auto)
+        self._prepare_seconds = None  # set by prepare() for re-use on reset
+        # Cache original gantry gains for ramping.
+        if hasattr(self.env, "_gantry_stiffness"):
+            self._gantry_orig_stiffness = self.env._gantry_stiffness
+            self._gantry_orig_damping = self.env._gantry_damping
+
     def safety_check(self):
         if not self.do_safety_check:
             return
@@ -111,6 +125,7 @@ class RlPipeline(Pipeline):
             logger.error("Robot fallen! Shutdown for safety.")
             if hasattr(self.env, "reborn"):
                 self.env.reborn()  # pyright: ignore[reportAttributeAccessIssue]
+                self.policy.reset_alignment()
             else:
                 self.env.shutdown()
 
@@ -126,6 +141,32 @@ class RlPipeline(Pipeline):
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")
                         self.env.reborn()  # pyright: ignore[reportAttributeAccessIssue]
+                        self.policy.reset_alignment()
+                case "[MOTION_RESET]" | "[MOTION_FADE_IN]":
+                    logger.info(f"{command} — re-entering blend-in phase")
+                    self._blend_out_active = False
+                    self._blend_out_step = 0
+                    self._user_fade_out = False
+                    # Re-run phase 2 of prepare (blend default → policy at frame 0).
+                    # Gantry stays active — _run_blend_in will fade it out.
+                    # The policy reset happens inside post_step_callback below.
+                    self._pending_blend_in = True
+                case "[MOTION_FADE_OUT]":
+                    if not self._blend_out_active:
+                        logger.info("Fade out — blending to default pose")
+                        self._blend_out_active = True
+                        self._blend_out_step = 0
+                        self._user_fade_out = True
+                        # Pause frame advancement in the policy.
+                        inner = getattr(self.policy, "policy", self.policy)
+                        if hasattr(inner, "_paused"):
+                            inner._paused = True
+                        # Activate gantry at current position.
+                        has_gantry = hasattr(self.env, "enable_gantry")
+                        if has_gantry:
+                            self.env.enable_gantry()
+                            self.env._gantry_stiffness = 0.0
+                            self.env._gantry_damping = 0.0
 
         self.ctrl_manager.post_step_callback(ctrl_data)
 
@@ -156,34 +197,73 @@ class RlPipeline(Pipeline):
         obs, extras = self.policy.get_observation(env_data, ctrl_data)
         pd_target = self.policy.get_pd_target(obs)
 
+        # -- Detect motion done, start blend-out --
+        has_gantry = hasattr(self.env, "enable_gantry")
+        callbacks = extras.get("CALLBACK", [])
+        if "[MOTION_DONE]" in callbacks and not self._blend_out_active:
+            logger.info("Motion done — blending out to default pose")
+            self._blend_out_active = True
+            self._blend_out_step = 0
+            # Activate gantry at current position so it can ramp up.
+            if has_gantry:
+                self.env.enable_gantry()
+                self.env._gantry_stiffness = 0.0
+                self.env._gantry_damping = 0.0
+
+        # -- Blend policy output → init pose (frame 0) + ramp gantry --
+        if self._blend_out_active:
+            alpha = min(self._blend_out_step / max(self._blend_out_duration, 1), 1.0)
+            pd_target = (1 - alpha) * pd_target + alpha * self._init_dof_pos
+            # Ramp gantry support from 0 → full
+            if has_gantry and self.env._gantry_enabled:
+                self.env._gantry_stiffness = self._gantry_orig_stiffness * alpha
+                self.env._gantry_damping = self._gantry_orig_damping * alpha
+            self._blend_out_step += 1
+
         if not dry_run:
             self.env.step(pd_target, extras.get("hand_pose", None))
 
         self.post_step_callback(env_data, ctrl_data, extras, pd_target)
 
-    def prepare(self, init_motor_angle=None):
-        if init_motor_angle is not None:
-            desired_motor_angle = init_motor_angle
-        else:
-            desired_motor_angle = self.policy.get_init_dof_pos()
+        # Handle pending blend-in (after MOTION_RESET / FADE_IN).
+        if self._pending_blend_in:
+            self._pending_blend_in = False
+            self._run_blend_in()
+            self._blend_in_completed = True
 
-        # logger.info(f"{desired_motor_angle=}")
-        current_motor_angle = np.array(self.env.dof_pos)
-        # logger.info(f"{current_motor_angle=}")
+    def _run_blend_in(self):
+        """Phase 2 of prepare: blend from init pose (frame 0) to policy output.
 
-        traj_len = 1000
+        If gantry is active (from blend-out), fade it out in sync.
+        Policy runs but frame stays at 0 (no post_step_callback).
+        """
+        secs = self._prepare_seconds or 3.0
+        blend_steps = int(secs * self.freq)
+        has_gantry = hasattr(self.env, "enable_gantry")
+        fading_gantry = has_gantry and self.env._gantry_enabled
+
+        logger.warning(
+            f"Blend-in: init DOF → policy ({blend_steps} steps, {secs:.1f}s)"
+            + (" + gantry fade-out" if fading_gantry else "")
+        )
+        pbar = ProgressBar("Blend in", blend_steps)
+
         last_step_time = time.time()
-        logger.warning("prepare_init")
-        pbar = ProgressBar("Prepare", traj_len)
+        for t in range(blend_steps):
+            alpha = t / max(blend_steps - 1, 1)
 
-        for t in range(traj_len):
-            current_motor_angle = np.array(self.env.dof_pos)
+            self.env.update()
+            env_data = self.env.get_data()
+            ctrl_data = self.ctrl_manager.get_ctrl_data(env_data)
+            obs, extras = self.policy.get_observation(env_data, ctrl_data)
+            policy_pd = self.policy.get_pd_target(obs)
 
-            blend_ratio = np.minimum(t / 300, 1)
-            action = (1 - blend_ratio) * current_motor_angle + blend_ratio * desired_motor_angle
+            action = (1 - alpha) * self._init_dof_pos + alpha * policy_pd
 
-            # warm up network
-            self.step(dry_run=True)
+            # Fade gantry out: full → 0
+            if fading_gantry:
+                self.env._gantry_stiffness = self._gantry_orig_stiffness * (1 - alpha)
+                self.env._gantry_damping = self._gantry_orig_damping * (1 - alpha)
 
             self.env.step(action)
 
@@ -194,13 +274,117 @@ class RlPipeline(Pipeline):
                 logger.error("Warning: frame drop")
             last_step_time = time.time()
             pbar.update()
-
-            if t == 0.9 * traj_len:
-                logger.info(f"{'=' * 10} RESET ZERO POSITION {'=' * 10}")
-                self.reset()
-
-        time.sleep(0.01)
         pbar.close()
+
+        # Release gantry, restore original gains.
+        if fading_gantry:
+            self.env._gantry_stiffness = self._gantry_orig_stiffness
+            self.env._gantry_damping = self._gantry_orig_damping
+            self.env.disable_gantry()
+
+        logger.warning("Blend-in done — motion starting")
+
+    def prepare(self, init_motor_angle=None, prepare_seconds=None):
+        self._prepare_seconds = prepare_seconds
+
+        if init_motor_angle is not None:
+            desired_motor_angle = init_motor_angle
+        else:
+            desired_motor_angle = self.policy.get_init_dof_pos()
+
+        has_gantry = hasattr(self.env, "enable_gantry")
+
+        # Convert seconds to steps (at policy frequency).
+        # Default: 3s ramp + 5s blend.  CLI --prepare-seconds overrides both.
+        if prepare_seconds is not None:
+            ramp_steps = int(prepare_seconds * self.freq)
+            blend_steps = int(prepare_seconds * self.freq)
+        else:
+            ramp_steps = int(3.0 * self.freq)
+            blend_steps = int(5.0 * self.freq)
+
+        # ── Phase 1: Gantry holds robot, ramp joints to init pose ──
+        logger.warning(
+            f"prepare: phase 1 — ramp joints ({ramp_steps} steps, "
+            f"{ramp_steps / self.freq:.1f}s, gantry support)"
+        )
+        pbar = ProgressBar("Prepare: ramp joints", ramp_steps)
+
+        if has_gantry:
+            self.env.enable_gantry()
+
+        last_step_time = time.time()
+        for t in range(ramp_steps):
+            current_motor_angle = np.array(self.env.dof_pos)
+            alpha = min(t / max(ramp_steps - 1, 1), 1.0)
+            action = (1 - alpha) * current_motor_angle + alpha * desired_motor_angle
+
+            self.env.step(action)
+
+            time_diff = last_step_time + self.dt - time.time()
+            if time_diff > 0:
+                time.sleep(time_diff)
+            else:
+                logger.error("Warning: frame drop")
+            last_step_time = time.time()
+            pbar.update()
+        pbar.close()
+
+        # Reset policy for a clean start — frame goes back to 0.
+        self.reset()
+
+        # ── Phase 2: Blend in policy + lower gantry ──
+        # Policy runs but frame stays at 0 (no post_step_callback).
+        # Actions blend from init DOF to policy output.
+        # Gantry support fades out linearly.
+        logger.warning(
+            f"prepare: phase 2 — blend policy ({blend_steps} steps, "
+            f"{blend_steps / self.freq:.1f}s, gantry lowering)"
+        )
+        pbar = ProgressBar("Prepare: blend policy", blend_steps)
+
+        if has_gantry:
+            orig_stiffness = self.env._gantry_stiffness
+            orig_damping = self.env._gantry_damping
+
+        last_step_time = time.time()
+        for t in range(blend_steps):
+            alpha = t / max(blend_steps - 1, 1)
+
+            # Run policy observation + action (frame stays at 0).
+            self.env.update()
+            env_data = self.env.get_data()
+            ctrl_data = self.ctrl_manager.get_ctrl_data(env_data)
+            obs, extras = self.policy.get_observation(env_data, ctrl_data)
+            policy_pd = self.policy.get_pd_target(obs)
+
+            # Blend: init DOF → policy output
+            action = (1 - alpha) * desired_motor_angle + alpha * policy_pd
+
+            # Fade gantry support
+            if has_gantry:
+                self.env._gantry_stiffness = orig_stiffness * (1 - alpha)
+                self.env._gantry_damping = orig_damping * (1 - alpha)
+
+            self.env.step(action)
+
+            # Do NOT call post_step_callback — frame stays at 0.
+
+            time_diff = last_step_time + self.dt - time.time()
+            if time_diff > 0:
+                time.sleep(time_diff)
+            else:
+                logger.error("Warning: frame drop")
+            last_step_time = time.time()
+            pbar.update()
+        pbar.close()
+
+        # ── Release ──
+        if has_gantry:
+            self.env._gantry_stiffness = orig_stiffness
+            self.env._gantry_damping = orig_damping
+            self.env.disable_gantry()
+
         logger.warning("prepare_done")
 
 

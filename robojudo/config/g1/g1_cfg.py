@@ -28,6 +28,7 @@ from .policy.g1_h2h_policy_cfg import G1H2HPolicyCfg  # noqa: F401
 from .policy.g1_kungfubot_policy_cfg import G1KungfuBotGeneralPolicyCfg, G1KungfuBotPolicyCfg  # noqa: F401
 from .policy.g1_smooth_policy_cfg import G1SmoothPolicyCfg  # noqa: F401
 from .policy.g1_twist_policy_cfg import G1TwistPolicyCfg  # noqa: F401
+from .policy.g1_protomotions_bm_tracker_cfg import ProtoMotionsBMTrackerPolicyCfg  # noqa: F401
 from .policy.g1_unitree_policy_cfg import G1UnitreePolicyCfg, G1UnitreeWoGaitPolicyCfg  # noqa: F401
 
 
@@ -333,6 +334,83 @@ class g1_switch_beyondmimic(RlMultiPolicyPipelineCfg):
         G1BeyondMimicPolicyCfg(policy_name="Waltz", without_state_estimator=False, max_timestep=850),
         G1BeyondMimicPolicyCfg(policy_name="Dance_wose", without_state_estimator=True),
     ]
+
+
+@cfg_registry.register
+class g1_beyondmimic_real(g1_beyondmimic):
+    """BeyondMimic Policy on real G1 hardware."""
+
+    env: G1RealEnvCfg = G1RealEnvCfg(
+        env_type="UnitreeCppEnv",
+        unitree=G1UnitreeCfg(
+            net_if="eth0",  # note: change to your network interface
+        ),
+    )
+    ctrl: list[UnitreeCtrlCfg] = [
+        UnitreeCtrlCfg(),
+    ]
+    do_safety_check: bool = True
+
+
+# ======================== ProtoMotions BM Tracker ======================== #
+
+
+@cfg_registry.register
+class g1_protomotions_bm_tracker(RlPipelineCfg):
+    """ProtoMotions BeyondMimic tracker with cached 50fps motion.
+
+    Uses the standard RoboJuDo G1 MuJoCo environment with ``born_place_align``
+    disabled (our policy handles heading alignment itself).
+
+    Usage::
+
+        cd robojudo && python scripts/run_pipeline.py -c g1_protomotions_bm_tracker \\
+            --onnx-path /path/to/unified_pipeline.onnx \\
+            --motion-path /path/to/motion.motion
+    """
+
+    robot: str = "g1"
+    env: G1MujocoEnvCfg = G1MujocoEnvCfg(
+        born_place_align=False,
+        random_heading=True,
+    )
+    ctrl: list[KeyboardCtrlCfg] = [
+        KeyboardCtrlCfg(
+            triggers={
+                "r": "[MOTION_RESET]",
+                "i": "[SIM_REBORN]",
+                "o": "[SHUTDOWN]",
+                "<": "[MOTION_FADE_IN]",
+                ">": "[MOTION_FADE_OUT]",
+            },
+        ),
+    ]
+
+    policy: ProtoMotionsBMTrackerPolicyCfg = ProtoMotionsBMTrackerPolicyCfg()
+
+
+@cfg_registry.register
+class g1_protomotions_bm_tracker_real(g1_protomotions_bm_tracker):
+    """ProtoMotions BeyondMimic tracker on real G1 hardware.
+
+    Usage::
+
+        cd robojudo && python scripts/run_pipeline.py -c g1_protomotions_bm_tracker_real \\
+            --onnx-path /path/to/unified_pipeline.onnx \\
+            --motion-path /path/to/motion.motion
+    """
+
+    env: G1RealEnvCfg = G1RealEnvCfg(
+        env_type="UnitreeCppEnv",
+        unitree=G1UnitreeCfg(
+            net_if="eth0",  # note: change to your network interface
+        ),
+        born_place_align=False,
+    )
+    ctrl: list[UnitreeCtrlCfg] = [
+        UnitreeCtrlCfg(),
+    ]
+    do_safety_check: bool = True
 
 
 # TIPS: check g1_loco_mimic_cfg.py for more complex examples
