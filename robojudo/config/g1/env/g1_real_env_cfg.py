@@ -20,7 +20,7 @@ class G1RealEnvCfg(G1EnvCfg, UnitreeEnvCfg):
     env_type: str = "UnitreeCppEnv"
     # ====== ENV CONFIGURATION ======
     unitree: UnitreeEnvCfg.UnitreeCfg = G1UnitreeCfg(
-        net_if="eth0",
+        net_if = "enp129s0",
     )
 
     odometry_type: Literal["NONE", "DUMMY", "UNITREE", "ZED"] = "UNITREE"
