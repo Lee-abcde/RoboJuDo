@@ -30,6 +30,7 @@ from .policy.g1_protomotions_tracker_cfg import ProtoMotionsTrackerPolicyCfg  # 
 from .policy.g1_smooth_policy_cfg import G1SmoothPolicyCfg  # noqa: F401
 from .policy.g1_twist_policy_cfg import G1TwistPolicyCfg  # noqa: F401
 from .policy.g1_unitree_policy_cfg import G1UnitreePolicyCfg, G1UnitreeWoGaitPolicyCfg  # noqa: F401
+from .policy.g1_vqpae_bm_cfg import VQPAEBMPolicyCfg  # noqa: F401
 
 
 # ======================== Basic Configs ======================== #
@@ -371,6 +372,33 @@ class g1_protomotions_tracker_real(g1_protomotions_tracker):
             --onnx-path /path/to/unified_pipeline.onnx \\
             --motion-path /path/to/motion.motion
     """
+
+    env: G1RealEnvCfg = G1RealEnvCfg(
+        env_type="UnitreeCppEnv",
+        unitree=G1UnitreeCfg(
+            net_if="eth0",
+        ),
+        born_place_align=False,
+    )
+    ctrl: list[UnitreeCtrlCfg] = [
+        UnitreeCtrlCfg(),
+    ]
+    do_safety_check: bool = True
+
+
+@cfg_registry.register
+class g1_vqpae_bm(RlPipelineCfg):
+    """ProtoMotions VQ-PAE BM pipeline."""
+
+    robot: str = "g1"
+    env: G1MujocoEnvCfg = G1MujocoEnvCfg(born_place_align=False)
+    policy: VQPAEBMPolicyCfg = VQPAEBMPolicyCfg()
+    ctrl: list[KeyboardCtrlCfg] = [KeyboardCtrlCfg()]
+
+
+@cfg_registry.register
+class g1_vqpae_bm_real(g1_vqpae_bm):
+    """ProtoMotions VQ-PAE BM pipeline on real G1 hardware."""
 
     env: G1RealEnvCfg = G1RealEnvCfg(
         env_type="UnitreeCppEnv",
