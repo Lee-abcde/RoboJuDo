@@ -376,7 +376,7 @@ class g1_protomotions_tracker_real(g1_protomotions_tracker):
     env: G1RealEnvCfg = G1RealEnvCfg(
         env_type="UnitreeCppEnv",
         unitree=G1UnitreeCfg(
-            net_if="eth0",
+            net_if="enp92s0",
         ),
         born_place_align=False,
     )
@@ -403,7 +403,7 @@ class g1_vqpae_bm_real(g1_vqpae_bm):
     env: G1RealEnvCfg = G1RealEnvCfg(
         env_type="UnitreeCppEnv",
         unitree=G1UnitreeCfg(
-            net_if="eth0",
+            net_if="enp92s0",
         ),
         born_place_align=False,
     )
